@@ -1,147 +1,225 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Form, Query
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import cv2
-import numpy as np
-from numpy import random
-from typing import List
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
+import shutil
+import os
 from io import BytesIO
+import pandas as pd
+import uuid
+import json
+import numpy as np
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+import database
+import schemas
+import crud
+import data_generator
+import config
+from utils import image_helpers
+from utils import image_augmentor
+from processing import classical, feature_based, cnn
+
+database.create_db_and_tables()
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this value in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def read_image(file: UploadFile) -> np.ndarray:
-    image = np.frombuffer(file.file.read(), np.uint8)
-    return cv2.imdecode(image, cv2.IMREAD_COLOR)
+app.mount(config.IMAGE_ACCESS_URL_PREFIX,
+          StaticFiles(directory=config.DATA_STORAGE_PATH),
+          name="stored_images")
 
-def to_bytes(image: np.ndarray) -> bytes:
-    success, encoded_image = cv2.imencode('.png', image)
-    if not success:
-        raise ValueError("Could not encode image")
-    return encoded_image.tobytes()
 
-def noise(image, percent):
-    noise_mask = random.rand(*image.shape[:2]) < (percent / 100)
-    noise_values = random.randint(0, 256, (image.shape[0], image.shape[1], 3), dtype=np.uint8)
-    image[noise_mask] = noise_values[noise_mask]
-    return image
+def _process_image_core(
+        image_np: np.ndarray,
+        processing_params: schemas.ProcessBaseRequest,
+        db_experiment_data: dict
+) -> dict:
 
-def noise_removal(image, power):
-    if power % 2 == 0:
-        power += 1
-    median = cv2.medianBlur(image, power)
-    return median
+    current_image_for_processing = image_np.copy()
+    aug_details = None
 
-def equalization(image):
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    image = cv2.equalizeHist(image)
-    image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    return image
+    # -- 1
+    if processing_params.augmentation and processing_params.augmentation.operation:
+        aug_op = processing_params.augmentation.operation
+        aug_param = processing_params.augmentation.parameter
 
-def color_correction(image):
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge((l, a, b))
-    output = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    return output
-
-def scaling(image, width, height):
-    image = cv2.resize(image, (width, height))
-    return image
-
-def rotation(image, angle):
-    height, width = image.shape[:2]
-    center = (width // 2, height // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1)
-    rotated_image = cv2.warpAffine(image, M, (width, height))
-    return rotated_image
-
-def glass_effect(image, power):
-    height, width = image.shape[:2]
-    dst = np.zeros_like(image)
-    offset_x = np.random.randint(0, power, (height, width))
-    offset_y = np.random.randint(0, power, (height, width))
-
-    for i in range(height):
-        for j in range(width):
-            new_x = min(height - 1, i + offset_x[i, j])
-            new_y = min(width - 1, j + offset_y[i, j])
-            dst[i, j] = image[new_x, new_y]
-    return dst
-
-def motion_blur(image, degree, angle):
-    image = np.array(image)
-    M = cv2.getRotationMatrix2D((degree / 2, degree / 2), angle, 1)
-    motion_blur_kernel = np.diag(np.ones(degree))
-    motion_blur_kernel = cv2.warpAffine(motion_blur_kernel, M, (degree, degree))
-    motion_blur_kernel = motion_blur_kernel / degree
-    blurred = cv2.filter2D(image, -1, motion_blur_kernel)
-    cv2.normalize(blurred, blurred, 0, 255, cv2.NORM_MINMAX)
-    blurred = np.array(blurred, dtype=np.uint8)
-    return blurred
-
-@app.post("/process")
-async def process_image(operation: str, files: List[UploadFile] = File(...), parameter: int = 0):
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
-    processed_images = []
-    for file in files:
-        image = read_image(file)
-
-        if operation == 'noise':
-            processed_image = noise(image, parameter)
-        elif operation == 'noise_removal':
-            processed_image = noise_removal(image, parameter)
-        elif operation == 'equalization':
-            processed_image = equalization(image)
-        elif operation == 'color_correction':
-            processed_image = color_correction(image)
-        elif operation == 'scaling':
-            if not parameter:
-                raise HTTPException(status_code=400, detail="parameter missing")
-            width, height = parameter, parameter
-            processed_image = scaling(image, width, height)
-        elif operation == 'rotation':
-            processed_image = rotation(image, parameter)
-        elif operation == 'glass_effect':
-            processed_image = glass_effect(image, parameter)
-        elif operation == 'motion_blur':
-            if not parameter:
-                raise HTTPException(status_code=400, detail="parameter expected")
-            degree, angle = parameter, parameter
-            processed_image = motion_blur(image, degree, angle)
-        else:
-            raise HTTPException(status_code=400, detail="Unknown operation")
-
-        processed_images.append((file.filename, processed_image))
-
-    if len(processed_images) == 1:
-        filename, image = processed_images[0]
-        return StreamingResponse(
-            BytesIO(to_bytes(image)),
-            media_type="image/png",
-            headers={'Content-Disposition': f'attachment; filename={filename}'}
-        )
-    else:
-        return [
-            StreamingResponse(
-                BytesIO(to_bytes(image)),
-                media_type="image/png",
-                headers={'Content-Disposition': f'attachment; filename={filename}'}
+        try:
+            augmented_image_np = image_augmentor.apply_augmentation(
+                current_image_for_processing, aug_op, aug_param
             )
-            for filename, image in processed_images
-        ]
+            current_image_for_processing = augmented_image_np
+            aug_details = {**processing_params.augmentation.model_dump()}
+        except Exception as e:
+            error_msg = f"Аугментация провалилась '{aug_op}': {str(e)}"
+            print(error_msg) # TODO debug
+            aug_details = {"error": error_msg, **processing_params.augmentation.model_dump()}
+
+    db_experiment_data["augmentation_details"] = aug_details
+
+    # -- 2
+    if processing_params.method1.apply:
+        method1_params = processing_params.method1.params or {}
+        db_experiment_data["result_method1"] = classical.count_cells_classical(
+            current_image_for_processing, method1_params
+        )
+        db_experiment_data["params_method1"] = method1_params
+
+    if processing_params.method2.apply:
+        method2_params = processing_params.method2.params or {}
+        db_experiment_data["result_method2"] = feature_based.count_cells_feature_based(
+            current_image_for_processing, method2_params
+        )
+        db_experiment_data["params_method2"] = method2_params
+
+    if processing_params.method3.apply:
+        method3_params = processing_params.method3.params or {}
+        db_experiment_data["result_method3"] = cnn.count_cells_cnn(
+            current_image_for_processing, method3_params
+        )
+        db_experiment_data["params_method3"] = method3_params
+
+    return db_experiment_data
+
+@app.post("/experiments/generate_and_process", response_model=schemas.ExperimentRecord, status_code=201)
+async def generate_and_process_experiment(
+        request_data: schemas.ProcessGeneratedImageRequest,
+        db: Session = Depends(database.get_db)
+):
+    image_np, true_cell_count = data_generator.generate_synthetic_cells_image(request_data.generator_params)
+    generated_filename, _ = image_helpers.save_image_to_path(
+        image_np, config.DATA_STORAGE_PATH, "gen_"
+    )
+    db_experiment_data = {
+        "data_source_type": "generated",
+        "data_source_info": {
+            "generator_params": request_data.generator_params.model_dump(),
+            "true_cell_count": true_cell_count,
+            "stored_filename": generated_filename
+        }
+    }
+    completed_experiment_data = _process_image_core(image_np, request_data, db_experiment_data)
+    experiment_to_create = schemas.ExperimentCreate(**completed_experiment_data)
+    created_experiment = crud.create_experiment(db, experiment_to_create)
+    return created_experiment
+
+
+@app.post("/experiments/upload_and_process", response_model=schemas.ExperimentRecord, status_code=201)
+async def upload_and_process_experiment(
+        file: UploadFile = File(...),
+        augmentation_json: Optional[str] = Form(None),
+        method1_json: Optional[str] = Form(None),
+        method2_json: Optional[str] = Form(None),
+        method3_json: Optional[str] = Form(None),
+        db: Session = Depends(database.get_db)
+):
+    original_filename = file.filename
+    stored_filename, stored_filepath = image_helpers.save_upload_file_to_storage(
+        file, config.DATA_STORAGE_PATH
+    )
+    try:
+        image_np = image_helpers.read_image_from_path(stored_filepath)
+        if image_np is None:
+            raise HTTPException(status_code=400, detail="Не удалось прочитать файл.")
+    except Exception as e:
+        if stored_filepath.exists():
+            os.remove(stored_filepath)
+        raise HTTPException(status_code=400, detail=f"Error: {str(e)}")
+
+    def parse_json_form_data(json_str: Optional[str], model_type: type):
+        if not json_str:
+            return model_type() if model_type == schemas.MethodExecutionParams else None
+        try:
+            data = json.loads(json_str)
+            return model_type(**data)
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"Неверный JSON для {model_type.__name__}: {json_str}. Error: {e}")
+
+    processing_params = schemas.ProcessBaseRequest(
+        augmentation=parse_json_form_data(augmentation_json, schemas.AugmentationParams),
+        method1=parse_json_form_data(method1_json, schemas.MethodExecutionParams),
+        method2=parse_json_form_data(method2_json, schemas.MethodExecutionParams),
+        method3=parse_json_form_data(method3_json, schemas.MethodExecutionParams),
+    )
+
+    db_experiment_data = {
+        "data_source_type": "real_file",
+        "data_source_info": {
+            "original_filename": original_filename,
+            "stored_filename": stored_filename
+        }
+    }
+    completed_experiment_data = _process_image_core(image_np, processing_params, db_experiment_data)
+    experiment_to_create = schemas.ExperimentCreate(**completed_experiment_data)
+    created_experiment = crud.create_experiment(db, experiment_to_create)
+    return created_experiment
+
+
+@app.get("/experiments", response_model=List[schemas.ExperimentRecord])
+async def list_experiments(
+        skip: int = 0,
+        limit: int = Query(default=20, ge=1, le=100),
+        db: Session = Depends(database.get_db)
+):
+    experiments = crud.get_experiments(db, skip=skip, limit=limit)
+    return experiments
+
+@app.get("/experiments/{experiment_id}", response_model=schemas.ExperimentRecord)
+async def get_experiment_details(experiment_id: int, db: Session = Depends(database.get_db)):
+    experiment = crud.get_experiment_by_id(db, experiment_id)
+    if not experiment:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    return experiment
+
+@app.get("/experiments/export/csv")
+async def export_experiments_to_csv(db: Session = Depends(database.get_db)):
+    experiments = crud.get_all_experiments_for_export(db)
+    if not experiments:
+        return JSONResponse(content={"message": "No experiments"}, status_code=404)
+
+    exp_list = []
+    for exp_obj in experiments:
+        exp_dict = {c.name: getattr(exp_obj, c.name) for c in exp_obj.__table__.columns}
+
+        ds_info = exp_dict.pop('data_source_info', {}) or {}
+        if exp_dict.get('data_source_type') == 'generated':
+            gen_params = ds_info.get('generator_params', {}) or {}
+            for k, v in gen_params.items():
+                exp_dict[f'gen_param_{k}'] = v
+            exp_dict['gen_true_cell_count'] = ds_info.get('true_cell_count')
+        exp_dict['ds_original_filename'] = ds_info.get('original_filename')
+        exp_dict['ds_stored_filename'] = ds_info.get('stored_filename')
+
+        aug_details = exp_dict.pop('augmentation_details', {}) or {}
+        exp_dict['aug_operation'] = aug_details.get('operation')
+        exp_dict['aug_parameter'] = aug_details.get('parameter')
+        exp_dict['aug_error'] = aug_details.get('error')
+        # exp_dict['aug_temp_filename'] = aug_details.get('augmented_temp_filename')
+        exp_dict['aug_stored_filename'] = aug_details.get('stored_augmented_filename')
+
+        exp_list.append(exp_dict)
+
+    df = pd.DataFrame(exp_list)
+
+    stream = BytesIO()
+    df.to_csv(stream, index=False, encoding='utf-8')
+    stream.seek(0)
+
+    return StreamingResponse(
+        stream,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=cell_counting_experiments.csv"}
+    )
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
